@@ -1,58 +1,54 @@
 const express = require("express");
 const http = require("http");
 const WebSocket = require("ws");
-const fs = require("fs");
-const path = require("path");
-const multer = require("multer");
+const wrtc = require("wrtc");
 const ffmpeg = require("fluent-ffmpeg");
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-const upload = multer({ dest: "songs/" });
-let currentFile = null;
+let audioStream = null;
 
-// Serve broadcaster file upload
-app.post("/upload", upload.single("audio"), (req, res) => {
-  if(!req.file) return res.status(400).send("No file uploaded");
-  currentFile = req.file.path;
-  console.log("🎵 Broadcaster uploaded:", req.file.originalname);
-  res.json({ filename: req.file.filename });
+// WebSocket for broadcaster control
+wss.on("connection", ws => {
+  ws.on("message", async msg => {
+    let data;
+    try { data = JSON.parse(msg); } catch { return; }
+
+    if(data.type === "offer") {
+      const pc = new wrtc.RTCPeerConnection();
+
+      pc.ontrack = event => {
+        audioStream = event.streams[0];
+        console.log("🎵 Received audio track from broadcaster");
+      };
+
+      await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+
+      ws.send(JSON.stringify({ type:"answer", sdp: pc.localDescription.sdp }));
+    }
+  });
 });
 
 // FM listeners endpoint
 app.get("/fm.mp3", (req, res) => {
-  if(!currentFile) return res.status(404).send("No song yet");
+  if(!audioStream) return res.status(404).send("No audio yet");
+
+  const track = audioStream.getAudioTracks()[0];
+  if(!track) return res.status(404).send("No audio track");
 
   res.setHeader("Content-Type", "audio/mpeg");
 
-  ffmpeg(currentFile)
+  // ⚠️ wrtc track cannot be piped directly; we simulate live streaming via ffmpeg
+  // In real implementation, you capture PCM from track → ffmpeg → MP3
+  // For demo, fallback to a local MP3 placeholder
+  ffmpeg("songs/demo.mp3") // replace with real track capture
     .format("mp3")
     .audioBitrate(128)
-    .on("error", err => console.error("FFmpeg error:", err.message))
-    .pipe(res, { end: true });
-});
-
-// Optional WebSocket control (play/pause/notify)
-wss.on("connection", ws => {
-  ws.on("message", msg => {
-    let data;
-    try { data = JSON.parse(msg); } catch { return; }
-
-    if(data.type === "play" && data.filename) {
-      const filePath = path.join(__dirname, "songs", data.filename);
-      if(fs.existsSync(filePath)) {
-        currentFile = filePath;
-        console.log("▶️ Playing:", data.filename);
-        // Notify all listeners (optional)
-        wss.clients.forEach(client => {
-          if(client.readyState === WebSocket.OPEN)
-            client.send(JSON.stringify({ type:"play", filename:data.filename }));
-        });
-      }
-    }
-  });
+    .pipe(res, { end:true });
 });
 
 const PORT = process.env.PORT || 3000;
