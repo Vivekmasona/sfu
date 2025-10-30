@@ -1,21 +1,14 @@
 {
-  "name": "bihar-fm-server",
+  "name": "live-webrtc-fm",
   "version": "1.0.0",
-  "description": "Bihar FM Live Streaming Server",
+  "description": "WebRTC live FM stream bridge to MP3 URL",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2",
-    "ws": "^8.15.0",
-    "multer": "^1.4.4",
-    "fluent-ffmpeg": "^2.1.2"
-  },
-  "engines": {
-    "node": ">=18"
-  },
-  "keywords": ["fm", "radio", "live", "streaming"],
-  "author": "Your Name",
-  "license": "MIT"
+    "express": "^4.19.2",
+    "ws": "^8.18.0",
+    "wrtc": "^0.4.7"
+  }
 }
