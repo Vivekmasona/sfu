@@ -1,38 +1,27 @@
-// server.js — WebRTC bridge -> /live.mp3 endpoint
-// npm i express ws wrtc child_process
-const express = require("express");
-const { WebSocketServer } = require("ws");
-const wrtc = require("wrtc");
-const { spawn } = require("child_process");
+// server.js — BiharFM WebRTC → MP3 stream (Render-ready)
+import express from "express";
+import { WebSocketServer } from "ws";
+import http from "http";
+import { spawn } from "child_process";
+import wrtc from "wrtc";
+import fs from "fs";
 
 const app = express();
-const server = require("http").createServer(app);
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// store active connection + ffmpeg
-let peerConnection = null;
+let broadcaster = null;
 let ffmpeg = null;
 
-app.use(express.static(".")); // serve host.html
-
-// --- serve live audio as HTTP stream ---
-app.get("/live.mp3", (req, res) => {
-  res.set({
-    "Content-Type": "audio/mpeg",
-    "Cache-Control": "no-cache",
-    "Connection": "keep-alive",
-    "Transfer-Encoding": "chunked"
-  });
-
-  console.log("🎧 Listener connected");
-  if (ffmpeg) {
-    ffmpeg.stdout.pipe(res);
-    req.on("close", () => {
-      try { ffmpeg.stdout.unpipe(res); } catch {}
-      console.log("❌ Listener left");
-    });
+// serve static for testing
+app.get("/", (_, res) => res.send("🎧 BiharFM signaling server running"));
+app.get("/live.mp3", (_, res) => {
+  const file = "./current.mp3";
+  if (fs.existsSync(file)) {
+    const stream = fs.createReadStream(file);
+    stream.pipe(res);
   } else {
-    res.status(503).end("No live stream");
+    res.status(404).send("No live stream yet");
   }
 });
 
@@ -40,75 +29,48 @@ wss.on("connection", ws => {
   ws.on("message", async msg => {
     const data = JSON.parse(msg);
 
+    // --- Offer from host ---
     if (data.offer) {
-      console.log("📡 Host connected, starting WebRTC...");
-      peerConnection = new wrtc.RTCPeerConnection();
+      console.log("🎤 Offer received");
+      broadcaster = ws;
+      const pc = new wrtc.RTCPeerConnection();
 
-      // Handle remote track (audio)
-      peerConnection.ontrack = (e) => {
-        console.log("🎙 Receiving audio stream");
-        const stream = e.streams[0];
+      pc.ontrack = ev => {
+        console.log("🎶 Track received, starting ffmpeg...");
+        const track = ev.streams[0].getAudioTracks()[0];
+        const receiver = pc.createReceiver(track);
+        const { readable } = receiver.createEncodedStreams();
 
-        // Create FFmpeg process to convert to MP3 live
+        // 🔥 FFmpeg encode to MP3 and serve
         ffmpeg = spawn("ffmpeg", [
-          "-loglevel", "error",
           "-f", "webm",
           "-i", "pipe:0",
-          "-vn",
           "-c:a", "libmp3lame",
           "-b:a", "128k",
           "-f", "mp3",
-          "pipe:1"
+          "current.mp3"
         ]);
 
-        // Read audio data and pipe to FFmpeg
-        const recorder = new wrtc.nonstandard.RTCAudioSink(stream.getAudioTracks()[0]);
-        const { RTCAudioSink } = wrtc.nonstandard;
-        const sink = new RTCAudioSink(stream.getAudioTracks()[0]);
-
-        sink.ondata = ({ samples }) => {
-          // Just to keep connection alive, WebRTC lib automatically feeds pipe:0
-        };
-
-        // Connect WebRTC to FFmpeg (standard approach via MediaStreamTrackProcessor)
-        const { MediaStreamTrack } = wrtc;
-        const audioTrack = stream.getAudioTracks()[0];
-        const reader = new wrtc.nonstandard.MediaStreamTrackProcessor(audioTrack).readable.getReader();
-
-        async function pump() {
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            ffmpeg.stdin.write(value.data);
-          }
-        }
-        pump();
+        readable.pipe(ffmpeg.stdin);
       };
 
-      await peerConnection.setRemoteDescription(data.offer);
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-      ws.send(JSON.stringify({ answer: peerConnection.localDescription }));
+      const desc = new wrtc.RTCSessionDescription(data.offer);
+      await pc.setRemoteDescription(desc);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      ws.send(JSON.stringify({ answer }));
 
-      peerConnection.onicecandidate = e => {
+      pc.onicecandidate = e => {
         if (e.candidate) ws.send(JSON.stringify({ ice: e.candidate }));
       };
     }
 
-    if (data.ice && peerConnection) {
-      await peerConnection.addIceCandidate(new wrtc.RTCIceCandidate(data.ice));
+    // --- ICE candidate ---
+    if (data.ice && broadcaster) {
+      // (not needed in single host)
     }
-  });
-
-  ws.on("close", () => {
-    console.log("❌ Host disconnected");
-    if (ffmpeg) {
-      try { ffmpeg.kill("SIGKILL"); } catch {}
-      ffmpeg = null;
-    }
-    peerConnection = null;
   });
 });
 
 const PORT = process.env.PORT || 10000;
-server.listen(PORT, () => console.log(`🚀 Live FM server running on ${PORT}`));
+server.listen(PORT, () => console.log("✅ BiharFM Signaling live on port", PORT));
