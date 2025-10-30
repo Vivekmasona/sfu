@@ -1,55 +1,114 @@
+// server.js — WebRTC bridge -> /live.mp3 endpoint
+// npm i express ws wrtc child_process
 const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
+const { WebSocketServer } = require("ws");
 const wrtc = require("wrtc");
-const ffmpeg = require("fluent-ffmpeg");
+const { spawn } = require("child_process");
 
 const app = express();
-const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const server = require("http").createServer(app);
+const wss = new WebSocketServer({ server });
 
-let audioStream = null;
+// store active connection + ffmpeg
+let peerConnection = null;
+let ffmpeg = null;
 
-// WebSocket for broadcaster control
+app.use(express.static(".")); // serve host.html
+
+// --- serve live audio as HTTP stream ---
+app.get("/live.mp3", (req, res) => {
+  res.set({
+    "Content-Type": "audio/mpeg",
+    "Cache-Control": "no-cache",
+    "Connection": "keep-alive",
+    "Transfer-Encoding": "chunked"
+  });
+
+  console.log("🎧 Listener connected");
+  if (ffmpeg) {
+    ffmpeg.stdout.pipe(res);
+    req.on("close", () => {
+      try { ffmpeg.stdout.unpipe(res); } catch {}
+      console.log("❌ Listener left");
+    });
+  } else {
+    res.status(503).end("No live stream");
+  }
+});
+
 wss.on("connection", ws => {
   ws.on("message", async msg => {
-    let data;
-    try { data = JSON.parse(msg); } catch { return; }
+    const data = JSON.parse(msg);
 
-    if(data.type === "offer") {
-      const pc = new wrtc.RTCPeerConnection();
+    if (data.offer) {
+      console.log("📡 Host connected, starting WebRTC...");
+      peerConnection = new wrtc.RTCPeerConnection();
 
-      pc.ontrack = event => {
-        audioStream = event.streams[0];
-        console.log("🎵 Received audio track from broadcaster");
+      // Handle remote track (audio)
+      peerConnection.ontrack = (e) => {
+        console.log("🎙 Receiving audio stream");
+        const stream = e.streams[0];
+
+        // Create FFmpeg process to convert to MP3 live
+        ffmpeg = spawn("ffmpeg", [
+          "-loglevel", "error",
+          "-f", "webm",
+          "-i", "pipe:0",
+          "-vn",
+          "-c:a", "libmp3lame",
+          "-b:a", "128k",
+          "-f", "mp3",
+          "pipe:1"
+        ]);
+
+        // Read audio data and pipe to FFmpeg
+        const recorder = new wrtc.nonstandard.RTCAudioSink(stream.getAudioTracks()[0]);
+        const { RTCAudioSink } = wrtc.nonstandard;
+        const sink = new RTCAudioSink(stream.getAudioTracks()[0]);
+
+        sink.ondata = ({ samples }) => {
+          // Just to keep connection alive, WebRTC lib automatically feeds pipe:0
+        };
+
+        // Connect WebRTC to FFmpeg (standard approach via MediaStreamTrackProcessor)
+        const { MediaStreamTrack } = wrtc;
+        const audioTrack = stream.getAudioTracks()[0];
+        const reader = new wrtc.nonstandard.MediaStreamTrackProcessor(audioTrack).readable.getReader();
+
+        async function pump() {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            ffmpeg.stdin.write(value.data);
+          }
+        }
+        pump();
       };
 
-      await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+      await peerConnection.setRemoteDescription(data.offer);
+      const answer = await peerConnection.createAnswer();
+      await peerConnection.setLocalDescription(answer);
+      ws.send(JSON.stringify({ answer: peerConnection.localDescription }));
 
-      ws.send(JSON.stringify({ type:"answer", sdp: pc.localDescription.sdp }));
+      peerConnection.onicecandidate = e => {
+        if (e.candidate) ws.send(JSON.stringify({ ice: e.candidate }));
+      };
     }
+
+    if (data.ice && peerConnection) {
+      await peerConnection.addIceCandidate(new wrtc.RTCIceCandidate(data.ice));
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("❌ Host disconnected");
+    if (ffmpeg) {
+      try { ffmpeg.kill("SIGKILL"); } catch {}
+      ffmpeg = null;
+    }
+    peerConnection = null;
   });
 });
 
-// FM listeners endpoint
-app.get("/fm.mp3", (req, res) => {
-  if(!audioStream) return res.status(404).send("No audio yet");
-
-  const track = audioStream.getAudioTracks()[0];
-  if(!track) return res.status(404).send("No audio track");
-
-  res.setHeader("Content-Type", "audio/mpeg");
-
-  // ⚠️ wrtc track cannot be piped directly; we simulate live streaming via ffmpeg
-  // In real implementation, you capture PCM from track → ffmpeg → MP3
-  // For demo, fallback to a local MP3 placeholder
-  ffmpeg("songs/demo.mp3") // replace with real track capture
-    .format("mp3")
-    .audioBitrate(128)
-    .pipe(res, { end:true });
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ FM server running on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+server.listen(PORT, () => console.log(`🚀 Live FM server running on ${PORT}`));
