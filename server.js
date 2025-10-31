@@ -1,55 +1,67 @@
-// server.js — BiharFM WebRTC to Icecast bridge
-// npm i express ws wrtc child_process
+// server.js — Live WebRTC → MP3 stream for browser/VLC both
+// npm i express ws wrtc child_process stream
 
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const wrtc = require("wrtc");
 const { spawn } = require("child_process");
+const { PassThrough } = require("stream");
 const http = require("http");
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-app.use(express.static(".")); // to serve host.html etc.
+let liveStream = null;
+
+app.get("/live.mp3", (req, res) => {
+  res.writeHead(200, {
+    "Content-Type": "audio/mpeg",
+    "Transfer-Encoding": "chunked",
+  });
+
+  if (liveStream) {
+    console.log("🎧 New listener connected");
+    liveStream.pipe(res);
+    req.on("close", () => liveStream.unpipe(res));
+  } else {
+    res.end("No live stream yet");
+  }
+});
 
 wss.on("connection", (ws) => {
-  console.log("🔗 New WebSocket client connected");
+  console.log("🔗 Broadcaster connected");
 
   ws.on("message", async (msg) => {
     const data = JSON.parse(msg);
 
     if (data.offer) {
-      console.log("📡 Got offer from broadcaster");
-
       const pc = new wrtc.RTCPeerConnection();
-      pc.onicecandidate = (e) => {
-        if (e.candidate) ws.send(JSON.stringify({ ice: e.candidate }));
-      };
 
-      // When stream arrives
       pc.ontrack = (event) => {
-        console.log("🎧 Receiving audio track...");
+        console.log("🎙 Receiving audio stream...");
         const [stream] = event.streams;
 
-        // Convert stream → FFmpeg → Icecast
+        // Create passthrough for broadcast
+        liveStream = new PassThrough();
+
         const ffmpeg = spawn("ffmpeg", [
           "-y",
           "-f", "webm",
           "-i", "pipe:0",
+          "-vn",
           "-acodec", "libmp3lame",
           "-b:a", "64k",
-          "-content_type", "audio/mpeg",
           "-f", "mp3",
-          "icecast://source:hackme@localhost:8000/live"
+          "pipe:1",
         ]);
 
+        ffmpeg.stdout.pipe(liveStream);
         ffmpeg.stderr.on("data", (d) => console.log(d.toString()));
-        ffmpeg.on("exit", () => console.log("❌ FFmpeg closed"));
 
-        // Convert remote track → readable audio chunks
+        // Convert remote WebRTC audio to ffmpeg input
         const recorder = new wrtc.nonstandard.MediaRecorder(stream, {
-          mimeType: "audio/webm"
+          mimeType: "audio/webm",
         });
         recorder.ondataavailable = (e) => ffmpeg.stdin.write(e.data);
         recorder.start(1000);
@@ -58,8 +70,7 @@ wss.on("connection", (ws) => {
       await pc.setRemoteDescription(new wrtc.RTCSessionDescription(data.offer));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-      ws.send(JSON.stringify({ answer }));
-      console.log("✅ Answer sent to client");
+      ws.send(JSON.stringify({ answer: pc.localDescription }));
     }
 
     if (data.ice) {
@@ -68,4 +79,4 @@ wss.on("connection", (ws) => {
   });
 });
 
-server.listen(10000, () => console.log("🚀 Server running on :10000"));
+server.listen(10000, () => console.log("🚀 BiharFM live server running on 10000"));
