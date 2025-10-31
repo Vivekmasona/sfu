@@ -1,74 +1,71 @@
-// server.js
+// server.js — BiharFM WebRTC to Icecast bridge
+// npm i express ws wrtc child_process
+
 const express = require("express");
 const { WebSocketServer } = require("ws");
 const wrtc = require("wrtc");
 const { spawn } = require("child_process");
+const http = require("http");
 
 const app = express();
-const server = require("http").createServer(app);
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-let peerConnection;
+app.use(express.static(".")); // to serve host.html etc.
 
-wss.on("connection", ws => {
-  ws.on("message", async msg => {
+wss.on("connection", (ws) => {
+  console.log("🔗 New WebSocket client connected");
+
+  ws.on("message", async (msg) => {
     const data = JSON.parse(msg);
 
     if (data.offer) {
-      console.log("🎧 Offer received");
+      console.log("📡 Got offer from broadcaster");
 
-      peerConnection = new wrtc.RTCPeerConnection();
+      const pc = new wrtc.RTCPeerConnection();
+      pc.onicecandidate = (e) => {
+        if (e.candidate) ws.send(JSON.stringify({ ice: e.candidate }));
+      };
 
-      peerConnection.ontrack = (e) => {
-        const [stream] = e.streams;
-        console.log("🎙 Receiving audio stream from host...");
+      // When stream arrives
+      pc.ontrack = (event) => {
+        console.log("🎧 Receiving audio track...");
+        const [stream] = event.streams;
 
-        // Capture WebRTC audio into FFmpeg
+        // Convert stream → FFmpeg → Icecast
         const ffmpeg = spawn("ffmpeg", [
+          "-y",
           "-f", "webm",
           "-i", "pipe:0",
           "-acodec", "libmp3lame",
-          "-b:a", "128k",
+          "-b:a", "64k",
           "-content_type", "audio/mpeg",
           "-f", "mp3",
           "icecast://source:hackme@localhost:8000/live"
         ]);
 
-        ffmpeg.stderr.on("data", d => console.log("FFmpeg:", d.toString()));
+        ffmpeg.stderr.on("data", (d) => console.log(d.toString()));
+        ffmpeg.on("exit", () => console.log("❌ FFmpeg closed"));
 
-        // Use MediaRecorder to get PCM chunks
-        const recorder = new wrtc.MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
-
-        recorder.ondataavailable = (event) => {
-          event.data.arrayBuffer().then(buf => {
-            ffmpeg.stdin.write(Buffer.from(buf));
-          });
-        };
-
-        recorder.onstop = () => {
-          ffmpeg.stdin.end();
-          console.log("🔴 Stream stopped");
-        };
-
-        recorder.start(100); // every 100ms chunk
+        // Convert remote track → readable audio chunks
+        const recorder = new wrtc.nonstandard.MediaRecorder(stream, {
+          mimeType: "audio/webm"
+        });
+        recorder.ondataavailable = (e) => ffmpeg.stdin.write(e.data);
+        recorder.start(1000);
       };
 
-      const desc = new wrtc.RTCSessionDescription(data.offer);
-      await peerConnection.setRemoteDescription(desc);
-      const answer = await peerConnection.createAnswer();
-      await peerConnection.setLocalDescription(answer);
-      ws.send(JSON.stringify({ answer: peerConnection.localDescription }));
-
-      peerConnection.onicecandidate = e => {
-        if (e.candidate) ws.send(JSON.stringify({ ice: e.candidate }));
-      };
+      await pc.setRemoteDescription(new wrtc.RTCSessionDescription(data.offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      ws.send(JSON.stringify({ answer }));
+      console.log("✅ Answer sent to client");
     }
 
     if (data.ice) {
-      await peerConnection.addIceCandidate(new wrtc.RTCIceCandidate(data.ice));
+      console.log("🧊 ICE received");
     }
   });
 });
 
-app.use(express.static("."));
-server.listen(8080, () => console.log("🚀 WebRTC → Icecast bridge on :8080"));
+server.listen(10000, () => console.log("🚀 Server running on :10000"));
